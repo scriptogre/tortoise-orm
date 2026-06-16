@@ -217,6 +217,7 @@ class MetaInfo:
         "fetch_db_defaults",
         "_default_ordering",
         "_ordering_validated",
+        "_statement_cache",
     )
 
     def __init__(self, meta: Model.Meta) -> None:
@@ -259,6 +260,7 @@ class MetaInfo:
         self.db_complex_fields: list[tuple[str, str, Field]] = []
         self.db_default_db_columns: tuple[str, ...] = ()
         self.fetch_db_defaults: bool = getattr(meta, "fetch_db_defaults", True)
+        self._statement_cache: dict[str, tuple] = {}
 
     @property
     def full_name(self) -> str:

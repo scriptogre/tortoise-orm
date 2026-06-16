@@ -28,11 +28,6 @@ if TYPE_CHECKING:  # pragma: nocoverage
     from tortoise.query_utils import Prefetch
     from tortoise.queryset import QuerySet
 
-EXECUTOR_CACHE: dict[
-    tuple[str, str | None, str],
-    tuple[list, str, list, str, str, dict[str, str]],
-] = {}
-
 CHUNK_SIZE = 2000
 
 
@@ -56,37 +51,10 @@ class BaseExecutor:
         self.prefetch_map = prefetch_map or {}
         self._prefetch_queries = prefetch_queries or {}
         self.select_related_idx = select_related_idx
-        key = (self.db.connection_name, self.model._meta.schema, self.model._meta.db_table)
-        if key not in EXECUTOR_CACHE:
-            self.regular_columns, columns = self._prepare_insert_columns()
-            self.insert_query = str(self._prepare_insert_statement(columns))
-            self.regular_columns_all = self.regular_columns
-            self.insert_query_all = self.insert_query
-            if self.model._meta.generated_db_fields:
-                self.regular_columns_all, columns_all = self._prepare_insert_columns(
-                    include_generated=True
-                )
-                self.insert_query_all = str(
-                    self._prepare_insert_statement(columns_all, has_generated=False)
-                )
 
-            table = self.model._meta.basetable
-            basequery = cast(QueryBuilder, self.model._meta.basequery)
-            self.delete_query = str(
-                basequery.where(table[self.model._meta.db_pk_column] == self.parameter(0)).delete()
-            )
-            self.update_cache: dict[str, str] = {}
-
-            EXECUTOR_CACHE[key] = (
-                self.regular_columns,
-                self.insert_query,
-                self.regular_columns_all,
-                self.insert_query_all,
-                self.delete_query,
-                self.update_cache,
-            )
-
-        else:
+        # compiled SQL per connection
+        cache = self.model._meta._statement_cache
+        if self.db.connection_name in cache:
             (
                 self.regular_columns,
                 self.insert_query,
@@ -94,7 +62,38 @@ class BaseExecutor:
                 self.insert_query_all,
                 self.delete_query,
                 self.update_cache,
-            ) = EXECUTOR_CACHE[key]
+                _,
+            ) = cache[self.db.connection_name]
+            return
+
+        self.regular_columns, columns = self._prepare_insert_columns()
+        self.insert_query = str(self._prepare_insert_statement(columns))
+        self.regular_columns_all = self.regular_columns
+        self.insert_query_all = self.insert_query
+        if self.model._meta.generated_db_fields:
+            self.regular_columns_all, columns_all = self._prepare_insert_columns(
+                include_generated=True
+            )
+            self.insert_query_all = str(
+                self._prepare_insert_statement(columns_all, has_generated=False)
+            )
+
+        table = self.model._meta.basetable
+        basequery = cast(QueryBuilder, self.model._meta.basequery)
+        self.delete_query = str(
+            basequery.where(table[self.model._meta.db_pk_column] == self.parameter(0)).delete()
+        )
+        self.update_cache: dict[str, str] = {}
+
+        cache[self.db.connection_name] = (
+            self.regular_columns,
+            self.insert_query,
+            self.regular_columns_all,
+            self.insert_query_all,
+            self.delete_query,
+            self.update_cache,
+            {},  # select cache
+        )
 
     async def execute_explain(
         self, sql: str, output_fmt: str | None = None, **options: bool

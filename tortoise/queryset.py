@@ -323,6 +323,76 @@ class AwaitableQuery(_ChooseDBMixin[MODEL], Generic[MODEL]):
         raise NotImplementedError()  # pragma: nocoverage
 
 
+class CachedQuery:
+    """Stand-in for QueryBuilder that returns pre-cached parameterized SQL."""
+
+    __slots__ = ("_sql", "_params")
+
+    def __init__(self, sql: str, params: list) -> None:
+        self._sql = sql
+        self._params = params
+
+    def get_parameterized_sql(self) -> tuple[str, list]:
+        return self._sql, self._params
+
+
+def cache_statement(make_query: Callable) -> Callable:
+    """Decorator that caches parameterized SQL for simple select queries.
+
+    On cache hit, skips query building entirely and returns a CachedQuery
+    with the cached SQL and fresh parameter values. Only caches queries with
+    simple equality filters on direct fields (no joins, annotations, or
+    expressions).
+    """
+
+    def wrapper(self: QuerySet) -> None:
+        select_cache = None
+        cache_key = None
+
+        if (not self._select_related and not self._annotations
+                and not self._fields_for_select and not self._distinct
+                and not self._select_for_update and not self._group_bys
+                and not self._having and not self._force_indexes
+                and not self._use_indexes and not self._prefetch_map
+                and not self._prefetch_queries and len(self._q_objects) == 1):
+            q = self._q_objects[0]
+            if not q.children and not q._is_negated and all(
+                "__" not in f and f in self.model._meta.fields_db_projection
+                and not isinstance(v, (Expression, Term))
+                for f, v in q.filters.items()
+            ):
+                db = self._db or self.model._meta.db
+                conn = db.connection_name
+                cache_key = (
+                    tuple(q.filters.keys()), tuple(self._orderings),
+                    self._limit is not None, self._offset is not None,
+                )
+                cached_stmts = self.model._meta._statement_cache.get(conn)
+                if cached_stmts is not None:
+                    select_cache = cached_stmts[6]
+                    cached = select_cache.get(cache_key)
+                    if cached is not None:
+                        sql, self._select_related_idx = cached
+                        params: list = [
+                            self.model._meta.fields_map[k].to_db_value(v, self.model)
+                            for k, v in q.filters.items()
+                        ]
+                        if self._limit is not None:
+                            params.append(self._limit)
+                        if self._offset is not None:
+                            params.append(self._offset)
+                        self.query = CachedQuery(sql, params)  # type: ignore[assignment]
+                        return
+
+        make_query(self)
+
+        if select_cache is not None and cache_key is not None:
+            sql, _ = self.query.get_parameterized_sql()
+            select_cache[cache_key] = (sql, self._select_related_idx)
+
+    return wrapper
+
+
 class QuerySet(AwaitableQuery[MODEL]):
     __slots__ = (
         "fields",
@@ -1236,26 +1306,23 @@ class QuerySet(AwaitableQuery[MODEL]):
                 *[table[field].as_(f"{table.get_table_name()}.{field}") for field in data_fields]
             )
 
+    @cache_statement  # e.g. SELECT .. FROM "event" WHERE "name" = ?
     def _make_query(self) -> None:
-        # clean tmp records first
         self._select_related_idx = []
         self._joined_tables = []
         table = self.model._meta.basetable
         if self._fields_for_select:
-            # select .only() fields
             self.query = self.model._meta.basequery.select()
             self._resolve_only(self._fields_for_select)
         else:
-            # select all fields
             self.query = copy(self.model._meta.basequery_all_fields)  # type:ignore[assignment]
-            append_item = (
+            self._select_related_idx.append((
                 self.model,
                 len(self.model._meta.db_fields) + len(self._annotations),
                 table,
                 self.model,
                 (None,),
-            )
-            self._select_related_idx.append(append_item)
+            ))
         self.resolve_ordering(
             self.model,
             self.model._meta.basetable,
